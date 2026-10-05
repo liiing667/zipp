@@ -169,6 +169,17 @@ class CompleteDirs(InitializedState, zipfile.ZipFile):
             zf.writestr(name, b"")
         return zf
 
+    def remove(self, name):
+        """
+        Remove an entry from the archive in place without
+        rewriting the file. The bytes of the entry remain in the
+        archive, but are no longer referenced by the central
+        directory written on close.
+        """
+        self.filelist = [info for info in self.filelist if info.filename != name]
+        self.NameToInfo = {info.filename: info for info in self.filelist}
+        self._didModify = True
+
 
 class FastLookup(CompleteDirs):
     """
@@ -337,7 +348,10 @@ class Path:
         zip_mode = mode[0]
         if zip_mode == 'r' and not self.exists():
             raise FileNotFoundError(self)
-        stream = self.root.open(self.at, zip_mode, pwd=pwd)
+        if zip_mode in 'wa':
+            stream = self._open_write(zip_mode)
+        else:
+            stream = self.root.open(self.at, zip_mode, pwd=pwd)
         if 'b' in mode:
             if args or kwargs:
                 raise ValueError("encoding args invalid for binary operation")
@@ -345,6 +359,25 @@ class Path:
         # Text mode:
         encoding, args, kwargs = _extract_text_encoding(*args, **kwargs)
         return io.TextIOWrapper(stream, encoding, *args, **kwargs)
+
+    def _open_write(self, zip_mode):
+        """
+        Open this entry for writing or appending, replacing any
+        existing entry of the same name.
+        """
+        self._check_writable()
+        prior = self.read_bytes() if zip_mode == 'a' and self.exists() else b''
+        if self.exists():
+            self.root.remove(self.at)
+        stream = self.root.open(self.at, 'w')
+        stream.write(prior)
+        return stream
+
+    def _check_writable(self):
+        if self.root.mode == 'r':
+            raise ValueError(
+                f"{self.root.mode!r} mode does not allow writing"
+            )
 
     def _base(self):
         return pathlib.PurePosixPath(self.at) if self.at else self.filename
@@ -377,6 +410,85 @@ class Path:
     def read_bytes(self):
         with self.open('rb') as strm:
             return strm.read()
+
+    def write_bytes(self, data):
+        with self.open('wb') as strm:
+            return strm.write(data)
+
+    def write_text(self, data, encoding=None, errors=None, newline=None):
+        with self.open('w', encoding=encoding, errors=errors, newline=newline) as strm:
+            return strm.write(data)
+
+    def mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        self._check_writable()
+        dir_at = self.at.rstrip('/') + '/'
+        if not self.at or dir_at in self.root._name_set():
+            if not exist_ok:
+                raise FileExistsError(self)
+            return
+        if self.at in self.root._name_set():
+            raise FileExistsError(self)
+        if not parents and not self._parent_exists():
+            raise FileNotFoundError(self)
+        if parents:
+            for parent in _parents(self.at.rstrip('/')):
+                name = parent + '/'
+                if name not in self.root._name_set():
+                    self.root.writestr(name, b'')
+        self.root.writestr(dir_at, b'')
+
+    def _parent_exists(self):
+        parent_at = posixpath.dirname(self.at.rstrip('/'))
+        return not parent_at or parent_at + '/' in self.root._name_set()
+
+    def touch(self, mode=0o666, exist_ok=True):
+        self._check_writable()
+        if self.exists():
+            if not exist_ok:
+                raise FileExistsError(self)
+            return
+        self.write_bytes(b'')
+
+    def unlink(self, missing_ok=False):
+        self._check_writable()
+        if not self.exists():
+            if not missing_ok:
+                raise FileNotFoundError(self)
+            return
+        if self.is_dir():
+            raise IsADirectoryError(self)
+        self.root.remove(self.at)
+
+    def rename(self, target):
+        self._check_writable()
+        if not self.exists():
+            raise FileNotFoundError(self)
+        dest = target if isinstance(target, Path) else self._next(target)
+        dest._check_writable()
+        if self.is_dir() and not dest.at.endswith('/'):
+            dest = dest._next(dest.at + '/')
+        if dest == self:
+            return dest
+        if self.is_dir():
+            prefix = self.at.rstrip('/') + '/'
+            entries = [
+                info
+                for info in self.root.infolist()
+                if info.filename == prefix or info.filename.startswith(prefix)
+            ]
+        else:
+            entries = [self.root.getinfo(self.at)]
+        moved = {}
+        for info in entries:
+            name = dest.at + info.filename[len(prefix if self.is_dir() else self.at):]
+            moved[name] = self.root.read(info)
+        for name, data in moved.items():
+            if name in dest.root._name_set():
+                dest.root.remove(name)
+            dest.root.writestr(name, data)
+        for info in entries:
+            self.root.remove(info.filename)
+        return dest
 
     def _is_child(self, path):
         return posixpath.dirname(path.at.rstrip("/")) == self.at.rstrip("/")

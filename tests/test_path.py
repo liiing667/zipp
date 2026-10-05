@@ -212,6 +212,144 @@ class TestPath(unittest.TestCase):
         with zf.joinpath('file.txt').open('w', encoding="utf-8") as strm:
             strm.write('text file')
 
+    def test_open_append(self):
+        """
+        Opening with mode 'a' should append to any existing content.
+        """
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        path = zf.joinpath('file.txt')
+        path.write_text('one', encoding='utf-8')
+        with path.open('a', encoding='utf-8') as strm:
+            strm.write('two')
+        assert path.read_text(encoding='utf-8') == 'onetwo'
+        with path.open('ab') as strm:
+            strm.write(b'!')
+        assert path.read_bytes() == b'onetwo!'
+
+    def test_write_replaces_entry(self):
+        """
+        Overwriting an existing entry must not leave duplicate names.
+        """
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        path = zf.joinpath('file.txt')
+        path.write_text('old', encoding='utf-8')
+        path.write_text('new', encoding='utf-8')
+        assert zf.root.namelist().count('file.txt') == 1
+        assert path.read_text(encoding='utf-8') == 'new'
+        path.write_bytes(b'bytes')
+        assert zf.root.namelist().count('file.txt') == 1
+        assert path.read_bytes() == b'bytes'
+
+    def test_write_text_returns_count(self):
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        assert zf.joinpath('f.txt').write_text('hello', encoding='utf-8') == 5
+        assert zf.joinpath('f.bin').write_bytes(b'hello') == 5
+
+    def test_write_in_append_mode_zipfile(self):
+        """
+        The motivating use case: write through a Path into a ZipFile
+        opened in append mode on disk.
+        """
+        with temp_dir() as tmpdir:
+            filename = pathlib.Path(tmpdir) / 'test.zip'
+            with zipfile.ZipFile(filename, 'a') as zf:
+                zipfile.Path(zf, 'a/b.txt').write_text('hi', encoding='utf-8')
+            with zipfile.ZipFile(filename, 'a') as zf:
+                zipfile.Path(zf, 'a/b.txt').write_text('hello', encoding='utf-8')
+            with zipfile.ZipFile(filename) as zf:
+                assert zf.namelist().count('a/b.txt') == 1
+                assert zipfile.Path(zf, 'a/b.txt').read_text(encoding='utf-8') == 'hello'
+
+    def test_writes_visible_to_iterdir(self):
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        zf.joinpath('a/b.txt').write_text('hi', encoding='utf-8')
+        (a,) = zf.iterdir()
+        assert a.is_dir()
+        (b,) = a.iterdir()
+        assert b.read_text(encoding='utf-8') == 'hi'
+
+    def test_write_requires_writable_zipfile(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as zf:
+            zf.writestr('file.txt', b'content')
+        root = zipfile.Path(zipfile.ZipFile(io.BytesIO(data.getvalue())))
+        file = root.joinpath('file.txt')
+        for op in [
+            lambda: file.open('w'),
+            lambda: file.open('a'),
+            lambda: file.write_text('text', encoding='utf-8'),
+            lambda: file.write_bytes(b'bytes'),
+            lambda: file.touch(),
+            lambda: file.unlink(),
+            lambda: file.rename('other.txt'),
+            lambda: root.joinpath('dir').mkdir(),
+        ]:
+            with self.assertRaises(ValueError):
+                op()
+
+    def test_mkdir(self):
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        zf.joinpath('dir').mkdir()
+        assert zf.joinpath('dir').is_dir()
+        with self.assertRaises(FileExistsError):
+            zf.joinpath('dir').mkdir()
+        zf.joinpath('dir').mkdir(exist_ok=True)
+        with self.assertRaises(FileNotFoundError):
+            zf.joinpath('missing/sub').mkdir()
+        zf.joinpath('missing/sub').mkdir(parents=True)
+        assert zf.joinpath('missing/sub').is_dir()
+        # mkdir over an existing file is never allowed
+        zf.joinpath('file.txt').write_bytes(b'content')
+        with self.assertRaises(FileExistsError):
+            zf.joinpath('file.txt').mkdir(exist_ok=True)
+
+    def test_touch(self):
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        file = zf.joinpath('file.txt')
+        file.touch()
+        assert file.is_file()
+        file.touch(exist_ok=True)
+        with self.assertRaises(FileExistsError):
+            file.touch(exist_ok=False)
+
+    def test_unlink(self):
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        file = zf.joinpath('file.txt')
+        file.write_bytes(b'content')
+        file.unlink()
+        assert not file.exists()
+        assert 'file.txt' not in zf.root.namelist()
+        with self.assertRaises(FileNotFoundError):
+            file.unlink()
+        file.unlink(missing_ok=True)
+        zf.joinpath('dir').mkdir()
+        with self.assertRaises(IsADirectoryError):
+            zf.joinpath('dir').unlink()
+
+    def test_rename(self):
+        zf = zipfile.Path(zipfile.ZipFile(io.BytesIO(), mode='w'))
+        zf.joinpath('b/c.txt').write_text('content of c', encoding='utf-8')
+        zf.joinpath('b/d/e.txt').write_text('content of e', encoding='utf-8')
+
+        moved = zf.joinpath('b/c.txt').rename('f.txt')
+        assert moved == zf.joinpath('f.txt')
+        assert moved.read_text(encoding='utf-8') == 'content of c'
+        assert not zf.joinpath('b/c.txt').exists()
+
+        moved_dir = zf.joinpath('b').rename('renamed')
+        assert moved_dir.joinpath('d/e.txt').read_text(encoding='utf-8') == 'content of e'
+        assert not zf.joinpath('b').exists()
+
+        # rename replaces an existing entry
+        zf.joinpath('one.txt').write_text('one', encoding='utf-8')
+        zf.joinpath('two.txt').write_text('two', encoding='utf-8')
+        zf.joinpath('one.txt').rename('two.txt')
+        assert zf.root.namelist().count('two.txt') == 1
+        assert zf.joinpath('two.txt').read_text(encoding='utf-8') == 'one'
+
+        with self.assertRaises(FileNotFoundError):
+            zf.joinpath('missing.txt').rename('other.txt')
+
     @pass_alpharep
     def test_open_extant_directory(self, alpharep):
         """

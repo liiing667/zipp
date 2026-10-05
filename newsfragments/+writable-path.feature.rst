@@ -1,0 +1,1 @@
+``Path`` is now writable. ``open`` accepts ``'w'`` and ``'a'`` modes, and the interface now includes ``write_text``, ``write_bytes``, ``mkdir``, ``touch``, ``unlink``, and ``rename`` for archives opened in ``'w'``, ``'x'``, or ``'a'`` mode. Write operations on an archive opened in ``'r'`` mode raise ``ValueError``.
